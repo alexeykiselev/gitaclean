@@ -7,7 +7,9 @@ import (
 	"github.com/google/go-github/github"
 	"golang.org/x/oauth2"
 	"gopkg.in/src-d/go-git.v4"
+	"gopkg.in/src-d/go-git.v4/config"
 	"gopkg.in/src-d/go-git.v4/plumbing"
+	"gopkg.in/src-d/go-git.v4/plumbing/transport/http"
 	"io"
 	"io/ioutil"
 	"os"
@@ -18,6 +20,7 @@ type Cleaner struct {
 	client     *github.Client
 	owner      string
 	repository string
+	token      string
 }
 
 func NewCleaner(token, owner, repository string) *Cleaner {
@@ -31,6 +34,7 @@ func NewCleaner(token, owner, repository string) *Cleaner {
 		client:     cl,
 		owner:      owner,
 		repository: repository,
+		token:      token,
 	}
 }
 
@@ -76,87 +80,41 @@ func (c *Cleaner) repo() (*github.Repository, error) {
 	return r, nil
 }
 
-func (c *Cleaner) clone(repo github.Repository) (*git.Repository, error) {
+func (c *Cleaner) clone(repo github.Repository) (*git.Repository, string, error) {
 	p, err := ioutil.TempDir("", "gitaclean")
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return git.PlainClone(p,  true, &git.CloneOptions{URL: *repo.CloneURL})
+	r, err := git.PlainClone(p, true, &git.CloneOptions{URL: *repo.CloneURL})
+	rem, _ := r.Remote("origin")
+	fmt.Println("REMOTE:", rem)
+	fmt.Println("OPTS:", rem.Config())
+	return r, p, err
 }
 
-func (c *Cleaner) remove(repo *git.Repository, tags []*github.RepositoryTag) error {
-	tagObjectsIter, err := repo.TagObjects()
+func (c *Cleaner) remove(repo *git.Repository, tags []*github.RepositoryTag) ([]*github.RepositoryTag, []*github.RepositoryTag, error) {
+	iter, err := repo.Tags()
 	if err != nil {
-		return err
+		return nil, tags, err
 	}
-	fmt.Println("CHECK")
-	fmt.Println("TAG OBJECTS:")
-	for _, to := range c.listTagObjects(repo) {
-		fmt.Println(to)
-	}
-	fmt.Println("TAG REFS:")
-	for _, tr := range c.listTagRefs(repo) {
-		fmt.Println(tr)
-	}
-	fmt.Println("-= Removing tag objects =-")
-	tagObj, e := tagObjectsIter.Next()
-	for e == nil || e != io.EOF {
-		for _, tt := range tags {
-			if tagObj.Name == *tt.Name {
-				rn := plumbing.ReferenceName("refs/tags/" + tagObj.Name)
-				fmt.Println("ID: ", tagObj.ID(), "Name:", tagObj.Name, "HASH:", tagObj.Hash, "TARGET:", tagObj.Target.String(), tagObj.TargetType.String())
-				to, err := repo.TagObject(tagObj.ID())
-				if err != nil {
-					fmt.Println("TO FAIL", err.Error())
-				}
-				repo.o
-				o := to.Decode()
-				err := repo.DeleteObject(tagObj.ID())
-				if err != nil {
-					fmt.Printf("Failed to delete tag object '%s': %s\n", tagObj.Name, err.Error())
-				} else {
-					err := repo.Storer.RemoveReference(rn)
-					if err != nil {
-						fmt.Printf("Failed to remove tag '%s': %s\n", tagObj.Name, err.Error())
-					} else {
-						fmt.Printf("Tag '%s' successfuly removed\n", tagObj.Name)
-					}
-				}
-				break
-			}
-		}
-		tagObj, e = tagObjectsIter.Next()
-	}
-	tagsIter, err := repo.Tags()
-	if err != nil {
-		return err
-	}
-	fmt.Println("-= Removing tag references =-")
-	tag, e := tagsIter.Next()
+	var s []*github.RepositoryTag
+	var f []*github.RepositoryTag
+	tag, e := iter.Next()
 	for e == nil || e != io.EOF {
 		for _, tt := range tags {
 			if tag.Name().IsTag() && tag.Name().Short() == *tt.Name {
 				err := repo.Storer.RemoveReference(plumbing.ReferenceName(tag.Name().String()))
 				if err != nil {
-					fmt.Printf("Failed to remove tag '%s': %s\n", tag.Name().Short(), err.Error())
+					f = append(f, tt)
 				} else {
-					fmt.Printf("Tag '%s' successfuly removed\n", tag.Name().Short())
+					s = append(s, tt)
 				}
 				break
 			}
 		}
-		tag, e = tagsIter.Next()
+		tag, e = iter.Next()
 	}
-	fmt.Println("CHECK")
-	fmt.Println("TAG OBJECTS:")
-	for _, t := range c.listTagObjects(repo) {
-		fmt.Println(t)
-	}
-	fmt.Println("TAG REFS:")
-	for _, t := range c.listTagRefs(repo) {
-		fmt.Println(t)
-	}
-	return nil
+	return s, f, nil
 }
 
 func (c *Cleaner) listTagObjects(repo *git.Repository) []string {
@@ -185,6 +143,12 @@ func (c *Cleaner) listTagRefs(repo *git.Repository) []string {
 		}
 	}
 	return r
+}
+
+func (c *Cleaner) Push(repo *git.Repository, refs []config.RefSpec) error {
+	auth := http.BasicAuth{Username: c.owner, Password: c.token}
+	o := git.PushOptions{RemoteName: "origin", Auth: &auth, RefSpecs: refs}
+	return repo.Push(&o)
 }
 
 var defaultOwner = "wavesplatform"
@@ -250,21 +214,38 @@ func main() {
 
 	if !dry {
 		fmt.Printf("Cloning repository '%s'...\n", *repo.Name)
-		clone, err := cleaner.clone(*repo)
+		clone, dir, err := cleaner.clone(*repo)
+		defer os.RemoveAll(dir)
 		if err != nil {
 			fmt.Println("Failed to clone repository:", err.Error())
 			os.Exit(1)
 		}
 		fmt.Println("Done")
 		fmt.Printf("Removing %d unreleased tags...\n", len(unreleased))
-		err = cleaner.remove(clone, unreleased)
+		sr, fr, err := cleaner.remove(clone, unreleased)
 		if err != nil {
-			fmt.Printf("Failed to remove unreleased tags")
+			fmt.Printf("Failed to remove unreleased tags\n")
 			os.Exit(1)
+		}
+		var refs []config.RefSpec
+		for _, t := range sr {
+			fmt.Printf("Successfully removed tag '%s'\n", *t.Name)
+			refs = append(refs, config.RefSpec(fmt.Sprintf(":refs/tags/%s", *t.Name)))
+		}
+		for _, t := range fr {
+			fmt.Printf("Failed to remove tag '%s'\n", *t.Name)
+		}
+		fmt.Println("Pushing repository...")
+		fmt.Println("REFS:", refs)
+		err = cleaner.Push(clone, refs)
+		if err != nil {
+			fmt.Printf("Failed to push repository: %s\n", err)
+		} else {
+			fmt.Println("Done")
 		}
 	} else {
 		for _, u := range unreleased {
-			fmt.Printf("DRY-RUN: Tag '%s' was removed\n", *u.Name)
+			fmt.Printf("Tag '%s' will be removed\n", *u.Name)
 		}
 	}
 
