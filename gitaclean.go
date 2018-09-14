@@ -8,10 +8,8 @@ import (
 	"golang.org/x/oauth2"
 	"gopkg.in/src-d/go-git.v4"
 	"gopkg.in/src-d/go-git.v4/config"
-	"gopkg.in/src-d/go-git.v4/plumbing"
 	"gopkg.in/src-d/go-git.v4/plumbing/transport/http"
-	"io"
-	"io/ioutil"
+	"gopkg.in/src-d/go-git.v4/storage/memory"
 	"os"
 )
 
@@ -80,72 +78,11 @@ func (c *Cleaner) repo() (*github.Repository, error) {
 	return r, nil
 }
 
-func (c *Cleaner) clone(repo github.Repository) (*git.Repository, string, error) {
-	p, err := ioutil.TempDir("", "gitaclean")
-	if err != nil {
-		return nil, "", err
-	}
-	r, err := git.PlainClone(p, true, &git.CloneOptions{URL: *repo.CloneURL})
-	rem, _ := r.Remote("origin")
-	fmt.Println("REMOTE:", rem)
-	fmt.Println("OPTS:", rem.Config())
-	return r, p, err
+func (c *Cleaner) clone(repo github.Repository) (*git.Repository, error) {
+	return git.Clone(memory.NewStorage(), nil, &git.CloneOptions{URL: *repo.CloneURL, Depth: 1, SingleBranch: true})
 }
 
-func (c *Cleaner) remove(repo *git.Repository, tags []*github.RepositoryTag) ([]*github.RepositoryTag, []*github.RepositoryTag, error) {
-	iter, err := repo.Tags()
-	if err != nil {
-		return nil, tags, err
-	}
-	var s []*github.RepositoryTag
-	var f []*github.RepositoryTag
-	tag, e := iter.Next()
-	for e == nil || e != io.EOF {
-		for _, tt := range tags {
-			if tag.Name().IsTag() && tag.Name().Short() == *tt.Name {
-				err := repo.Storer.RemoveReference(plumbing.ReferenceName(tag.Name().String()))
-				if err != nil {
-					f = append(f, tt)
-				} else {
-					s = append(s, tt)
-				}
-				break
-			}
-		}
-		tag, e = iter.Next()
-	}
-	return s, f, nil
-}
-
-func (c *Cleaner) listTagObjects(repo *git.Repository) []string {
-	var r []string
-	iter, err := repo.TagObjects()
-	if err == nil {
-		t, e := iter.Next()
-		for e == nil || e != io.EOF {
-			r = append(r, t.Name)
-			t, e = iter.Next()
-		}
-	}
-	return r
-}
-
-func (c *Cleaner) listTagRefs(repo *git.Repository) []string {
-	var r []string
-	iter, err := repo.Tags()
-	if err == nil {
-		t, e := iter.Next()
-		for e == nil || e != io.EOF {
-			if t.Name().IsTag() {
-				r = append(r, t.Name().Short())
-			}
-			t, e = iter.Next()
-		}
-	}
-	return r
-}
-
-func (c *Cleaner) Push(repo *git.Repository, refs []config.RefSpec) error {
+func (c *Cleaner) push(repo *git.Repository, refs []config.RefSpec) error {
 	auth := http.BasicAuth{Username: c.owner, Password: c.token}
 	o := git.PushOptions{RemoteName: "origin", Auth: &auth, RefSpecs: refs}
 	return repo.Push(&o)
@@ -214,30 +151,20 @@ func main() {
 
 	if !dry {
 		fmt.Printf("Cloning repository '%s'...\n", *repo.Name)
-		clone, dir, err := cleaner.clone(*repo)
-		defer os.RemoveAll(dir)
+		clone, err := cleaner.clone(*repo)
 		if err != nil {
 			fmt.Println("Failed to clone repository:", err.Error())
 			os.Exit(1)
 		}
 		fmt.Println("Done")
 		fmt.Printf("Removing %d unreleased tags...\n", len(unreleased))
-		sr, fr, err := cleaner.remove(clone, unreleased)
-		if err != nil {
-			fmt.Printf("Failed to remove unreleased tags\n")
-			os.Exit(1)
-		}
 		var refs []config.RefSpec
-		for _, t := range sr {
+		for _, t := range unreleased {
 			fmt.Printf("Successfully removed tag '%s'\n", *t.Name)
 			refs = append(refs, config.RefSpec(fmt.Sprintf(":refs/tags/%s", *t.Name)))
 		}
-		for _, t := range fr {
-			fmt.Printf("Failed to remove tag '%s'\n", *t.Name)
-		}
 		fmt.Println("Pushing repository...")
-		fmt.Println("REFS:", refs)
-		err = cleaner.Push(clone, refs)
+		err = cleaner.push(clone, refs)
 		if err != nil {
 			fmt.Printf("Failed to push repository: %s\n", err)
 		} else {
@@ -247,6 +174,7 @@ func main() {
 		for _, u := range unreleased {
 			fmt.Printf("Tag '%s' will be removed\n", *u.Name)
 		}
+		fmt.Printf("%d unreleased tag(s) will be removed\n", len(unreleased))
 	}
 
 }
