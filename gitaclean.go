@@ -90,12 +90,14 @@ func (c *Cleaner) push(repo *git.Repository, refs []config.RefSpec) error {
 
 var defaultOwner = "wavesplatform"
 var defaultRepository = "Waves"
+var version string
 
 func main() {
 	var owner string
 	var repository string
 	var token string
 	var dry bool
+	var v bool
 
 	flag.StringVar(&owner, "o", defaultOwner, "repository owner name")
 	flag.StringVar(&owner, "owner", defaultOwner, "repository owner name")
@@ -104,7 +106,14 @@ func main() {
 	flag.StringVar(&token, "t", "", "GitHub application token")
 	flag.StringVar(&token, "token", "", "GitHub application token")
 	flag.BoolVar(&dry, "dry-run", false, "print tags that will be removed")
+	flag.BoolVar(&v, "v", false, "show version")
+	flag.BoolVar(&v, "version", false, "show version")
 	flag.Parse()
+
+	if v {
+		fmt.Println("gitaclean", version)
+		os.Exit(0)
+	}
 
 	if token == "" {
 		fmt.Println("Empty GitHub application token")
